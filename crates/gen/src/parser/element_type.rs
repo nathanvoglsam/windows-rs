@@ -36,6 +36,7 @@ pub enum ElementType {
     Struct(types::Struct),
     Delegate(types::Delegate),
     Callback(types::Callback),
+    Array(usize, Box<ElementType>),
 }
 
 impl ElementType {
@@ -135,7 +136,38 @@ impl ElementType {
                 }
             }
             0x13 => generics[blob.read_unsigned() as usize].clone(),
-            0x14 => Self::NotYetSupported, // arrays
+            0x14 => {
+                let inner_kind = Self::from_blob(blob, generics);
+
+                // TODO: Don't know how to handle multi dimensional arrays yet
+                let rank = blob.read_unsigned();
+                if rank != 1 {
+                    panic!("Unsupported array rank: {}", rank);
+                }
+
+                // TODO: Don't know how to handle unsized arrays yet
+                let num_upper_bounds = blob.read_unsigned();
+                if num_upper_bounds != 1 {
+                    panic!("Unsupported array upper bound count: {}", num_upper_bounds);
+                }
+
+                let upper_bound = blob.read_unsigned();
+
+                // TODO: Don't know how to handle unsized arrays yet
+                let num_lower_bounds = blob.read_unsigned();
+                if num_lower_bounds != 1 {
+                    panic!("Unsupported array lower bound count: {}", num_lower_bounds);
+                }
+
+                // It's not possible for rust to represent a non 0 lower bound in any sane ABI
+                // compatible manner without generating a boat load of support code
+                let low_bound = blob.read_signed();
+                if low_bound != 0 {
+                    panic!("Unsupported array lower bound: {}", low_bound);
+                }
+
+                Self::Array(upper_bound as usize, Box::new(inner_kind))
+            }, // arrays
             0x15 => {
                 let def = GenericType::from_blob(blob, generics);
                 match def.def.kind() {
@@ -221,6 +253,11 @@ impl ElementType {
             Self::Struct(t) => t.0.gen_name(gen),
             Self::Delegate(t) => t.0.gen_name(gen),
             Self::Callback(t) => t.0.gen_name(gen),
+            Self::Array(size, kind) => {
+                let inner = kind.gen_name(gen);
+                let size = *size;
+                quote! { [#inner; #size] }
+            }
             _ => unexpected!(),
         }
     }
@@ -285,6 +322,11 @@ impl ElementType {
             Self::Callback(_) => {
                 quote! { ::windows::RawPtr }
             }
+            Self::Array(size, kind) => {
+                let inner = kind.gen_abi_name(gen);
+                let size = *size;
+                quote! { [#inner; #size] }
+            }
             _ => unexpected!(),
         }
     }
@@ -304,6 +346,34 @@ impl ElementType {
             | Self::ISize
             | Self::USize => quote! { 0 },
             Self::F32 | Self::F64 => quote! { 0.0 },
+            Self::Array(size, kind) => {
+                // Need to generate an array initializer of the form `[0,0,0,0]` rather than of the
+                // form `[0;4]` because rust requires a Copy type for the short form.
+                //
+                // Can't use ::std::default::Default::default() either as we're still waiting on
+                // const-generics to have that implemented for [T: Default; N] rather than for only
+                // up to [T: Default; 32].
+                //
+                // It works, it's a bit icky :/
+                //
+                // TODO: When const-generics on stable this can be changed to be less stupid
+
+                // Make a token stream for the inner type's default
+                let inner_default = kind.gen_default();
+
+                // Token stream for a single comma. Only way I could find to implement this
+                let comma = quote! { , };
+
+                // Stamp out the inner part of the really verbose array token stream
+                let array_tokens = (0..*size).into_iter().fold(TokenStream::new(), |mut v, _| {
+                    v.combine(&inner_default);
+                    v.combine(&comma);
+                    v
+                });
+
+                // Finally, wrap the big pile of tokens in the array's braces
+                quote! { [#array_tokens] }
+            }
             _ => quote! { ::std::default::Default::default() },
         }
     }
@@ -345,6 +415,11 @@ impl ElementType {
             Self::Struct(t) => t.dependencies(),
             Self::Delegate(t) => t.dependencies(),
             Self::Callback(t) => t.dependencies(),
+            Self::Array(_, t) => {
+                let mut deps = t.dependencies();
+                deps.append(&mut self.definition());
+                deps
+            },
             _ => Vec::new(),
         }
     }
@@ -362,6 +437,7 @@ impl ElementType {
             Self::Matrix3x2 => {
                 vec![TypeReader::get().resolve_type("Windows.Foundation.Numerics", "Matrix3x2")]
             }
+            Self::Array(_, t) => t.definition(),
             _ => Vec::new(),
         }
     }
